@@ -1804,13 +1804,14 @@ class Trainer:
                     steps_trained_progress_bar = None
 
                 if step % args.gradient_accumulation_steps == 0:
-                    if step != 0:
-                        torch.cuda.nvtx.range_pop()
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
-                    torch.cuda.nvtx.range_push("train_step")
 
                 with self.accelerator.accumulate(model):
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_push("train_step")
                     tr_loss_step = self.training_step(model, inputs)
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_pop()
 
                 if (
                     args.logging_nan_inf_filter
