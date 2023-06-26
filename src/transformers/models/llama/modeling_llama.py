@@ -81,11 +81,15 @@ class LlamaRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaRMSNorm")
         input_dtype = hidden_states.dtype
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-        return (self.weight * hidden_states).to(input_dtype)
+        output = (self.weight * hidden_states).to(input_dtype)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        return output
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -107,6 +111,8 @@ class LlamaRotaryEmbedding(torch.nn.Module):
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaRotaryEmbedding")
         if seq_len > self.max_seq_len_cached:
             self.max_seq_len_cached = seq_len
             t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
@@ -115,10 +121,13 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
             self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(x.dtype), persistent=False)
             self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(x.dtype), persistent=False)
-        return (
+        output = (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        return output
 
 
 def rotate_half(x):
@@ -153,7 +162,12 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaMLP")
+        output = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        return output
 
 
 class LlamaAttention(nn.Module):
@@ -190,17 +204,34 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention")
         bsz, q_len, _ = hidden_states.size()
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention_q_proj")
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention_k_proj")
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention_v_proj")
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention_rotary_emb")
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         # [bsz, nh, t, hd]
 
         if past_key_value is not None:
@@ -209,9 +240,11 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention_matmul_q_k")
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
@@ -229,8 +262,12 @@ class LlamaAttention(nn.Module):
             )
 
         # upcast attention to fp32
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention_softmax_matmul")
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -240,12 +277,15 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaAttention_o_proj")
         attn_output = self.o_proj(attn_output)
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         if not output_attentions:
             attn_weights = None
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         return attn_output, attn_weights, past_key_value
 
 
@@ -284,12 +324,15 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaDecoderLayer")
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaDecoderLayer_attn")
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -298,6 +341,8 @@ class LlamaDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -313,7 +358,8 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         return outputs
 
 
@@ -494,6 +540,8 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push("LlamaModel")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -554,6 +602,8 @@ class LlamaModel(LlamaPreTrainedModel):
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push(f"LlamaModel_layer_{idx}")
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -592,7 +642,8 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -600,6 +651,8 @@ class LlamaModel(LlamaPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -680,7 +733,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"LlamaForCausalLM")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -688,6 +742,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"LlamaForCausalLM_model")
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -699,10 +755,14 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         hidden_states = outputs[0]
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"LlamaForCausalLM_lm_head")
         logits = self.lm_head(hidden_states)
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
@@ -719,7 +779,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -821,8 +882,11 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"LlamaForSequenceClassification")
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"LlamaForSequenceClassification_model")
         transformer_outputs = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -834,9 +898,14 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         hidden_states = transformer_outputs[0]
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(f"LlamaForSequenceClassification_score")
         logits = self.score(hidden_states)
-
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         if input_ids is not None:
             batch_size = input_ids.shape[0]
         else:
@@ -877,6 +946,8 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         if not return_dict:
             output = (pooled_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
