@@ -1226,6 +1226,14 @@ class TrainingArguments:
         },
     )
 
+    nsys_log_start_step: Optional[int] = field(
+        default=8,
+    )
+
+    nsys_log_stop_step: Optional[int] = field(
+        default=16,
+    )
+
     def __post_init__(self):
         # expand paths, if not os.makedirs("~/bar") will make directory
         # in the current directory instead of the actual home
