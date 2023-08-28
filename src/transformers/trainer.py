@@ -1813,6 +1813,15 @@ class Trainer:
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
+                if step == args.nsys_log_start_step:
+                    with torch.cuda.device(torch.cuda.current_device()):
+                        torch.cuda.cudart().cudaProfilerStart()
+
+                if step == args.nsys_log_stop_step:
+                    with torch.cuda.device(torch.cuda.current_device()):
+                        torch.cuda.cudart().cudaProfilerStop()
+                    torch.distributed.barrier()
+                    assert 0
                 total_batched_samples += 1
                 if rng_to_sync:
                     self._load_rng_state(resume_from_checkpoint)
@@ -1834,7 +1843,11 @@ class Trainer:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_push("train_step")
                     tr_loss_step = self.training_step(model, inputs)
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_pop()
 
                 if (
                     args.logging_nan_inf_filter
